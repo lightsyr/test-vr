@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover" />
+  <title>WebXR Mobile — Cena simples com sensores + gamepad</title>
+  <style>
+    html,body { height:100%; margin:0; background:#000; color:#fff; font-family: sans-serif; }
+    #overlay {
+      position: absolute; left: 12px; top: 12px; z-index: 10;
+      background: rgba(0,0,0,0.4); padding:8px; border-radius:8px;
+      backdrop-filter: blur(4px);
+    }
+    button { font-size:16px; padding:8px 12px; margin:4px 0; }
+    #msg { font-size:14px; margin-top:6px; }
+    canvas { display:block; width:100%; height:100%; }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <div>
+      <button id="startXR">Entrar em VR (immersive-vr)</button>
+      <button id="startSensors">Ativar Sensores (fallback)</button>
+    </div>
+    <div id="msg">Aguardando...</div>
+    <div style="margin-top:8px;font-size:13px">Controles: thumbstick do gamepad / direcional para mover. Toque e arraste para olhar (fallback).</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { VRButton } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/webxr/VRButton.js';
+
+    // --- Setup básico three.js ---
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x6ea8ff);
+
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 2000);
+
+    const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true; // habilita WebXR
+    document.body.appendChild(renderer.domElement);
+
+    // Adiciona o botão VR (aparecerá se o navegador suportar immersive-vr)
+    document.body.appendChild(VRButton.createButton(renderer));
+
+    // Uma "rig" para o jogador: um Object3D que segura a câmera.
+    // Em WebXR a câmera será substituída pelo renderer.xr, mas manteremos a rig
+    // para aplicar movimentos (translate) vindos do gamepad.
+    const rig = new THREE.Object3D();
+    rig.position.set(0, 1.6, 3); // altura inicial
+    rig.add(camera);
+    scene.add(rig);
+
+    // Chão
+    const groundGeo = new THREE.PlaneGeometry(80,80);
+    const groundMat = new THREE.MeshStandardMaterial({ color: 0x556b2f });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI/2;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // Luz
+    const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+    dir.position.set(5,10,7);
+    scene.add(dir);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+
+    // Cubos espalhados
+    const boxGeo = new THREE.BoxGeometry(0.6,0.6,0.6);
+    for(let i=0;i<12;i++){
+      const m = new THREE.MeshStandardMaterial({ color: new THREE.Color().setHSL(Math.random(), 0.6, 0.5) });
+      const cube = new THREE.Mesh(boxGeo, m);
+      cube.position.set((Math.random()-0.5)*15, 0.3, (Math.random()-0.5)*15);
+      cube.castShadow = true;
+      scene.add(cube);
+    }
+
+    // Controls para debug não-XR (orbit)
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0,1.2,0);
+    controls.update();
+
+    // Mensagens UI
+    const msgEl = document.getElementById('msg');
+    function setMsg(t){ msgEl.textContent = t; }
+
+    // --- Movimento do jogador (gamepad/thumbstick) ---
+    // velocidade (m/s)
+    const moveSpeed = 2.2;
+    // vantagem: centralizamos movimento no "rig" para que, em XR, quando o usuário
+    // mover com o touchpad/thumbstick a câmera se moverá junto.
+    let xrSession = null;
+
+    function handleGamepadInput(dt){
+      // 1) Se estamos em sessão XR, prefira usar session.inputSources[].gamepad
+      if (xrSession){
+        for (const inputSource of xrSession.inputSources){
+          if (inputSource && inputSource.gamepad && inputSource.gamepad.axes.length >= 2){
+            const axes = inputSource.gamepad.axes;
+            const x = axes[0]; // left-right
+            const y = axes[1]; // forward-back
+            applyMoveFromAxes(x, y, dt);
+          }
+        }
+        return;
+      }
+
+      // 2) Fora do XR, use navigator.getGamepads()
+      const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+      for (const gp of gps){
+        if (!gp) continue;
+        // tenta ler eixos do primeiro stick
+        if (gp.axes && gp.axes.length >= 2){
+          const x = gp.axes[0];
+          const y = gp.axes[1];
+          // deadzone
+          if (Math.abs(x) > 0.12 || Math.abs(y) > 0.12){
+            applyMoveFromAxes(x, y, dt);
+            return;
+          }
+        }
+      }
+    }
+
+    function applyMoveFromAxes(x, y, dt){
+      // mover no plano XZ relativo à rotação do rig (ou da câmera se preferir)
+      const forward = new THREE.Vector3(0,0,-1);
+      // usar a rotação Y do rig (para mover na direção para a qual o jogador está virado)
+      const euler = new THREE.Euler(0, rig.rotation.y, 0, 'YXZ');
+      forward.applyEuler(euler);
+      const right = new THREE.Vector3(1,0,0).applyEuler(euler);
+
+      const move = new THREE.Vector3();
+      // y é forward/back, x é lateral
+      move.addScaledVector(forward, -y * moveSpeed * dt);
+      move.addScaledVector(right, x * moveSpeed * dt);
+
+      rig.position.add(move);
+    }
+
+    // --- Device Orientation (sensores do celular) fallback ---
+    // Em muitos cenários VR o WebXR fornece pose; esse fallback é para quando
+    // não há sessão XR mas você quer usar giroscópio/compass para orientar a câmera.
+    let usingDeviceOrientation = false;
+    let deviceQuaternion = new THREE.Quaternion();
+
+    async function enableDeviceOrientation(){
+      // iOS 13+ requer permissao via requestPermission
+      if (typeof DeviceOrientationEvent !== 'undefined' &&
+          typeof DeviceOrientationEvent.requestPermission === 'function') {
+        try {
+          const res = await DeviceOrientationEvent.requestPermission();
+          if (res !== 'granted'){ setMsg('Permissão de sensores não concedida'); return; }
+        } catch(err){
+          console.warn('DeviceOrientation permission error', err);
+          setMsg('Erro ao solicitar permissão de sensores');
+          return;
+        }
+      }
+      window.addEventListener('deviceorientation', onDeviceOrientation, true);
+      usingDeviceOrientation = true;
+      setMsg('Sensores ativados (fallback). Use o dispositivo para olhar ao redor.');
+    }
+
+    function onDeviceOrientation(evt){
+      // evt.alpha, beta, gamma -> converter para quaternion Three.js
+      // (utilizamos um método simples com Euler + ordem adequada).
+      const alpha = evt.alpha ? THREE.MathUtils.degToRad(evt.alpha) : 0;
+      const beta  = evt.beta  ? THREE.MathUtils.degToRad(evt.beta)  : 0;
+      const gamma = evt.gamma ? THREE.MathUtils.degToRad(evt.gamma) : 0;
+      // Ajuste de eixos: esta conversão é um bom ponto de partida; em apps
+      // reais você pode precisar ajustar offsets / compass heading.
+      const euler = new THREE.Euler(beta, alpha, -gamma, 'YXZ');
+      deviceQuaternion.setFromEuler(euler);
+    }
+
+    // --- XR session handling ---
+    renderer.xr.addEventListener('sessionstart', () => {
+      xrSession = renderer.xr.getSession();
+      setMsg('Sessão XR iniciada');
+    });
+    renderer.xr.addEventListener('sessionend', () => {
+      xrSession = null;
+      setMsg('Sessão XR finalizada');
+    });
+
+    document.getElementById('startXR').addEventListener('click', async ()=>{
+      // Botão manual que tenta iniciar immersive-vr
+      setMsg('Verificando suporte XR...');
+      if (navigator.xr && navigator.xr.isSessionSupported){
+        const supported = await navigator.xr.isSessionSupported('immersive-vr');
+        if (!supported){ setMsg('immersive-vr não suportado neste dispositivo'); return; }
+      }
+      // O VRButton já cria uma ação de entrada, mas aqui possuímos um botão extra.
+      try {
+        // iniciar sessão via renderer/VRButton
+        await navigator.xr.requestSession
+          ? renderer.xr.setSession(await navigator.xr.requestSession('immersive-vr'))
+          : null;
+        // se o browser não expor requestSession diretamente (casos diversos), o VRButton lida com isso.
+      } catch(err){
+        console.error('erro iniciando XR', err);
+        setMsg('Erro ao iniciar XR: ' + (err && err.message ? err.message : String(err)));
+      }
+    });
+
+    document.getElementById('startSensors').addEventListener('click', async ()=>{
+      await enableDeviceOrientation();
+    });
+
+    // --- Interação touch simples (fallback) para olhar ao redor ---
+    let isPointerDown = false, lastX=0, lastY=0;
+    renderer.domElement.addEventListener('pointerdown', (e)=>{
+      isPointerDown = true; lastX = e.clientX; lastY = e.clientY;
+    });
+    renderer.domElement.addEventListener('pointerup', ()=> isPointerDown = false);
+    renderer.domElement.addEventListener('pointermove', (e)=>{
+      if (!isPointerDown) return;
+      const dx = (e.clientX - lastX) * 0.005;
+      const dy = (e.clientY - lastY) * 0.005;
+      lastX = e.clientX; lastY = e.clientY;
+      // aplicar rotação Y na rig (girar o jogador horizontalmente)
+      rig.rotation.y -= dx;
+      // pitch: mover a câmera localmente
+      const pitchLimit = Math.PI/2 - 0.1;
+      camera.rotation.x = THREE.MathUtils.clamp(camera.rotation.x - dy, -pitchLimit, pitchLimit);
+    });
+
+    // --- Main loop ---
+    const clock = new THREE.Clock();
+
+    function animate(){
+      renderer.setAnimationLoop( render );
+    }
+
+    function render(){
+      const dt = clock.getDelta();
+
+      // 1) Gamepad input -> move rig
+      handleGamepadInput(dt);
+
+      // 2) If using device orientation fallback and NOT in XR:
+      if (usingDeviceOrientation && !xrSession){
+        // aplicar deviceQuaternion suavemente
+        camera.quaternion.slerp(deviceQuaternion, 0.6);
+      }
+
+      // Atualizar UI debug pos
+      // (em XR a camera world position é gerenciada pelo XR runtime)
+      // Mostramos posição do rig
+      setMsg(`Pos: ${rig.position.x.toFixed(2)}, ${rig.position.y.toFixed(2)}, ${rig.position.z.toFixed(2)}`);
+
+      renderer.render(scene, camera);
+    }
+
+    // resize
+    window.addEventListener('resize', ()=>{
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // iniciar loop
+    animate();
+
+    // Dica: se quiser testar gamepad no desktop, conecte um controle (e.g. Xbox/PS) e use o thumbstick.
+    // Em sessões XR, alguns controllers são expostos como inputSources com gamepad property.
+  </script>
+</body>
+</html>
